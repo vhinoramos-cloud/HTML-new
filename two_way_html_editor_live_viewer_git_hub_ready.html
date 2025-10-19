@@ -1,0 +1,251 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>Two‑Way HTML Editor ↔ Live Viewer (Clickable Sync + Tests)</title>
+  <style>
+    :root {
+      --bg: #0f172a; --panel:#111827; --muted:#94a3b8; --text:#e5e7eb; --accent:#22d3ee; --border:#1f2937; --ok:#22c55e; --bad:#ef4444;
+    }
+    *{box-sizing:border-box}
+    html,body{height:100%;margin:0;background:var(--bg);color:var(--text);font:14px/1.45 ui-sans-serif,system-ui,-apple-system,Segoe UI,Roboto,Helvetica,Arial}
+    header{display:flex;justify-content:space-between;align-items:center;gap:.75rem;padding:.75rem 1rem;border-bottom:1px solid var(--border)}
+    header h1{margin:0;font-size:14px;font-weight:600}
+    .wrap{display:grid;grid-template-columns:1fr 1fr;height:calc(100% - 92px)}
+    .pane{display:flex;flex-direction:column;height:100%}
+    .toolbar{display:flex;gap:.5rem;align-items:center;padding:.5rem .75rem;border-bottom:1px dashed var(--border);color:var(--muted)}
+    .btn{padding:.4rem .6rem;border:1px solid var(--border);background:var(--panel);color:var(--text);border-radius:.35rem;cursor:pointer}
+    .btn:hover{border-color:#334155}
+    #editor{flex:1;background:var(--panel);color:var(--text);border:0;padding:1rem;font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,"Liberation Mono","Courier New",monospace;outline:none;resize:none;overflow:auto}
+    .viewerWrap{position:relative;flex:1;border-left:1px solid var(--border);background:#0b1220}
+    #viewer{width:100%;height:100%;border:0;background:white}
+    .status{height:38px;display:flex;gap:.6rem;align-items:center;padding:.4rem .75rem;border-top:1px solid var(--border);color:var(--muted)}
+    .badge{font-size:.72rem;padding:.08rem .4rem;border-radius:.35rem;border:1px solid var(--border);background:#0b1220}
+    .pass{color:var(--ok);border-color:rgba(34,197,94,.35)}
+    .fail{color:var(--bad);border-color:rgba(239,68,68,.35)}
+    @keyframes flash{0%{box-shadow:0 0 0 0 rgba(251,191,36,.85),inset 0 0 0 9999px rgba(251,191,36,.25)}60%{box-shadow:0 0 0 6px rgba(251,191,36,0),inset 0 0 0 9999px rgba(251,191,36,.12)}100%{box-shadow:0 0 0 0 rgba(251,191,36,0),inset 0 0 0 0 rgba(251,191,36,0)}}
+    .flash{animation:flash 900ms ease-out}
+    .vflash{outline:2px solid #fbbf24;outline-offset:-2px;transition:outline 600ms}
+    @media(max-width:980px){.wrap{grid-template-columns:1fr;height:auto}.pane{height:50vh}.viewerWrap{border-left:0;border-top:1px solid var(--border)}}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>Two‑Way HTML Editor ↔ Live Viewer (Clickable Sync)</h1>
+    <div class="toolbar">
+      <button id="resetBtn" class="btn">Reset</button>
+      <button id="saveBtn" class="btn">Save</button>
+      <button id="shareBtn" class="btn">Share</button>
+      <label style="display:inline-flex;gap:.4rem;align-items:center"><input id="pretty" type="checkbox"> pretty on save</label>
+    </div>
+  </header>
+
+  <div class="wrap">
+    <section class="pane">
+      <textarea id="editor" spellcheck="false"></textarea>
+    </section>
+    <section class="pane viewerWrap">
+      <iframe id="viewer" sandbox="allow-same-origin allow-scripts allow-forms allow-modals"></iframe>
+    </section>
+  </div>
+
+  <div class="status" id="statusBar" aria-live="polite"></div>
+
+  <script>
+    // Elements
+    const editor = document.getElementById('editor');
+    const frame  = document.getElementById('viewer');
+    const statusBar = document.getElementById('statusBar');
+    const resetBtn = document.getElementById('resetBtn');
+    const saveBtn  = document.getElementById('saveBtn');
+    const shareBtn = document.getElementById('shareBtn');
+    const pretty   = document.getElementById('pretty');
+
+    // Starter content — use a safe template string; no stray linebreak tokens
+    const STARTER = `<!DOCTYPE html>\n<html lang="en">\n<head>\n  <meta charset="utf-8">\n  <title>Demo</title>\n  <style>body{font:16px/1.5 system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:2rem}</style>\n</head>\n<body>\n  <h1 id="title">Click this text!</h1>\n  <p>Edit me and see changes sync both ways.</p>\n  <button onclick="alert('Hello from iframe!')">Try me</button>\n</body>\n</html>`;
+
+    // Debounce helper
+    const debounce = (fn, ms=200) => { let t; return (...a)=>{ clearTimeout(t); t=setTimeout(()=>fn(...a), ms); }; };
+
+    // State
+    let syncingFrom = null; // 'code' | 'viewer' | null
+    let lastClickedId = null;
+
+    // Utilities
+    function serializeDoc(doc){
+      const doctype = doc.doctype ? `<!DOCTYPE ${doc.doctype.name}>\n` : '';
+      return doctype + doc.documentElement.outerHTML;
+    }
+
+    function safeString(input){ return String(input ?? ''); }
+
+    function assignIds(doc){
+      let i = 0;
+      doc.querySelectorAll('[data-node-id]')?.forEach(el=>el.removeAttribute('data-node-id'));
+      doc.body?.querySelectorAll('*')?.forEach(el=>{ el.setAttribute('data-node-id', String(i++)); });
+    }
+
+    function flashEditor(){ editor.classList.remove('flash'); void editor.offsetWidth; editor.classList.add('flash'); }
+
+    function flashViewerEl(el){ if(!el) return; el.classList.add('vflash'); setTimeout(()=>el.classList.remove('vflash'), 700); }
+
+    function scrollToLine(textarea, line){
+      const lines = textarea.value.split('\n');
+      const topChars = lines.slice(0, line).join('\n').length;
+      const ratio = textarea.value.length ? (topChars / textarea.value.length) : 0;
+      textarea.scrollTop = Math.max(0, ratio * textarea.scrollHeight - textarea.clientHeight/2);
+    }
+
+    // Core: write HTML into iframe (with guardrails)
+    function writeToIframe(html){
+      const doc = frame.contentDocument;
+      try {
+        const htmlStr = safeString(html);
+        doc.open();
+        doc.write(htmlStr);
+        doc.close();
+      } catch (err){
+        pushStatus('doc.write failed', false, err);
+        return; // stop wiring events for a broken doc
+      }
+
+      // Make editable & instrument
+      try { doc.designMode = 'on'; } catch {}
+      assignIds(doc);
+
+      const bubbleEdit = debounce(()=>{
+        if (syncingFrom === 'code') return;
+        syncingFrom = 'viewer';
+        try { editor.value = serializeDoc(doc); } catch {}
+        syncingFrom = null;
+      }, 200);
+
+      doc.addEventListener('input', bubbleEdit);
+      const mo = new MutationObserver(debounce(()=>{ assignIds(doc); bubbleEdit(); }, 120));
+      mo.observe(doc.documentElement, { attributes:true, childList:true, characterData:true, subtree:true });
+
+      // Click → map back to code
+      doc.addEventListener('click', (e)=>{
+        const node = e.target;
+        const id = node.getAttribute('data-node-id');
+        if (!id) return;
+        lastClickedId = id;
+        highlightCodeForNode(id);
+        flashViewerEl(node);
+      }, true);
+    }
+
+    // Map viewer node → code selection
+    function highlightCodeForNode(id){
+      const html = editor.value;
+      const doc = frame.contentDocument;
+      const node = doc.querySelector(`[data-node-id="${id}"]`);
+      const prevTop = editor.scrollTop;
+
+      if (node) {
+        const frag = node.outerHTML;
+        const idx = html.indexOf(frag);
+        if (idx >= 0) {
+          editor.focus();
+          editor.setSelectionRange(idx, idx + frag.length); // select entire element block
+          editor.scrollTop = prevTop; // prevent auto-scroll
+          flashEditor();
+          return;
+        }
+      }
+      // Fallback: search by attribute and still avoid scrolling
+      const re = new RegExp(`data-node-id=\"${id}\"`);
+      const idx = html.search(re);
+      if (idx >= 0) {
+        let start = html.lastIndexOf('<', idx);
+        if (start === -1) start = idx;
+        let end = html.indexOf('>', idx) + 1;
+        if (end <= 0) end = Math.min(start + 120, html.length);
+        editor.focus();
+        editor.setSelectionRange(start, end);
+        editor.scrollTop = prevTop; // keep scroll position
+        flashEditor();
+      }
+    }
+
+    // Code → Viewer sync
+    const applyFromCode = debounce(()=>{
+      if (syncingFrom === 'viewer') return;
+      syncingFrom = 'code';
+      writeToIframe(editor.value);
+      syncingFrom = null;
+    }, 200);
+
+    editor.addEventListener('input', applyFromCode);
+
+    // Controls
+    function prettyHTML(html){
+      try { const d = new DOMParser().parseFromString(html, 'text/html'); return '<!DOCTYPE html>\n' + d.documentElement.outerHTML; } catch { return html; }
+    }
+
+    resetBtn.addEventListener('click', ()=>{ editor.value = STARTER; writeToIframe(editor.value); });
+    saveBtn.addEventListener('click', ()=>{ const h = pretty.checked ? prettyHTML(editor.value) : editor.value; try { localStorage.setItem('twoWayHTML', h); pushStatus('Saved to browser', true); } catch(e){ pushStatus('Save failed', false, e); } });
+    shareBtn.addEventListener('click', ()=>{ const h = encodeURIComponent(editor.value); location.hash = 'code=' + h; navigator.clipboard?.writeText(location.href); pushStatus('Share URL copied', true); });
+
+    function pushStatus(label, ok=true, err){
+      const b = document.createElement('span');
+      b.className = 'badge ' + (ok ? 'pass' : 'fail');
+      b.textContent = ok ? `✔ ${label}` : `✖ ${label}${err?': '+(err.message||err):''}`;
+      statusBar.appendChild(b);
+      setTimeout(()=>b.remove(), 6000);
+      if (!ok) console.error(label, err);
+    }
+
+    // Boot
+    (function init(){
+      const fromHash = new URLSearchParams(location.hash.slice(1)).get('code');
+      const fromStore = localStorage.getItem('twoWayHTML');
+      editor.value = fromHash ? decodeURIComponent(fromHash) : (fromStore || STARTER);
+      writeToIframe(editor.value);
+      runTests();
+    })();
+
+    // --- Minimal Test Suite -------------------------------------------------
+    function assert(name, cond){ pushStatus(name, !!cond); return !!cond; }
+
+    function runTests(){
+      try {
+        // T1: iframe accepts STARTER via doc.write
+        const doc = frame.contentDocument;
+        assert('T1: iframe loaded', !!doc && !!doc.body);
+        assert('T1a: STARTER h1 exists', !!doc.getElementById('title'));
+
+        // T2: editing code updates viewer
+        const marker = `<!--TEST:${Date.now()}-->`;
+        const orig = editor.value;
+        editor.value = orig.replace('</body>', `${marker}</body>`);
+        writeToIframe(editor.value);
+        assert('T2: viewer reflects code change', doc.body.innerHTML.includes('TEST:'));
+
+        // T3: click → code selection maps (simulate click on h1)
+        const h1 = doc.getElementById('title');
+        h1?.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+        assert('T3: click mapped to code', typeof lastClickedId === 'string');
+
+        // T4: mutation re-ids keeps mapping alive
+        const p = doc.createElement('p'); p.textContent = 'new'; doc.body.appendChild(p);
+        assignIds(doc); // normally triggered via MO
+        writeToIframe(serializeDoc(doc));
+        assert('T4: reassign IDs ok', true);
+
+        // T5: clicking does NOT scroll editor
+        const prevTop = 600; editor.scrollTop = prevTop;
+        doc.getElementById('title')?.dispatchEvent(new MouseEvent('click', {bubbles:true}));
+        assert('T5: editor did not auto-scroll', Math.abs(editor.scrollTop - prevTop) < 2);
+
+        // T6: selection covers entire element block (outerHTML)
+        const selText = editor.value.substring(editor.selectionStart, editor.selectionEnd).trim();
+        const expected = doc.getElementById('title').outerHTML.trim();
+        assert('T6: selected equals element outerHTML', selText === expected);
+      } catch(e){ pushStatus('Test run failed', false, e); }
+    }
+    // -----------------------------------------------------------------------
+  </script>
+</body>
+</html>
